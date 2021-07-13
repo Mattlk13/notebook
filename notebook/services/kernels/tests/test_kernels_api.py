@@ -4,6 +4,7 @@ import json
 import sys
 import time
 
+from requests import HTTPError
 from traitlets.config import Config
 
 from tornado.httpclient import HTTPRequest
@@ -203,8 +204,6 @@ class AsyncKernelAPITest(KernelAPITest):
     def setup_class(cls):
         if not async_testing_enabled:  # Can be removed once jupyter_client >= 6.1 is required.
             raise SkipTest("AsyncKernelAPITest tests skipped due to down-level jupyter_client!")
-        if sys.version_info < (3, 6):  # Can be removed once 3.5 is dropped.
-            raise SkipTest("AsyncKernelAPITest tests skipped due to Python < 3.6!")
         super(AsyncKernelAPITest, cls).setup_class()
 
     @classmethod
@@ -234,3 +233,54 @@ class KernelFilterTest(NotebookTestBase):
     # Sanity check verifying that the configurable was properly set.
     def test_config(self):
         self.assertEqual(self.notebook.kernel_manager.allowed_message_types, ['kernel_info_request'])
+
+
+CULL_TIMEOUT = 5
+CULL_INTERVAL = 1
+
+
+class KernelCullingTest(NotebookTestBase):
+    """Test kernel culling """
+
+    @classmethod
+    def get_argv(cls):
+        argv = super(KernelCullingTest, cls).get_argv()
+
+        # Enable culling with 5s timeout and 1s intervals
+        argv.extend(['--MappingKernelManager.cull_idle_timeout={}'.format(CULL_TIMEOUT),
+                     '--MappingKernelManager.cull_interval={}'.format(CULL_INTERVAL),
+                     '--MappingKernelManager.cull_connected=False'])
+        return argv
+
+    def setUp(self):
+        self.kern_api = KernelAPI(self.request,
+                                  base_url=self.base_url(),
+                                  headers=self.auth_headers(),
+                                  )
+
+    def tearDown(self):
+        for k in self.kern_api.list().json():
+            self.kern_api.shutdown(k['id'])
+
+    def test_culling(self):
+        kid = self.kern_api.start().json()['id']
+        ws = self.kern_api.websocket(kid)
+        model = self.kern_api.get(kid).json()
+        self.assertEqual(model['connections'], 1)
+        assert not self.get_cull_status(kid)  # connected, should not be culled
+        ws.close()
+        assert self.get_cull_status(kid)  # not connected, should be culled
+
+    def get_cull_status(self, kid):
+        frequency = 0.5
+        culled = False
+        for _ in range(int((CULL_TIMEOUT + CULL_INTERVAL)/frequency)):  # Timeout + Interval will ensure cull
+            try:
+                self.kern_api.get(kid)
+            except HTTPError as e:
+                assert e.response.status_code == 404
+                culled = True
+                break
+            else:
+                time.sleep(frequency)
+        return culled

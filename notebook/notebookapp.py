@@ -1,20 +1,19 @@
-# coding: utf-8
 """A tornado based Jupyter notebook server."""
 
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
-
-from __future__ import absolute_import, print_function
 
 import notebook
 import asyncio
 import binascii
 import datetime
 import errno
+import functools
 import gettext
 import hashlib
 import hmac
 import importlib
+import inspect
 import io
 import ipaddress
 import json
@@ -26,6 +25,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -45,29 +45,28 @@ from jinja2 import Environment, FileSystemLoader
 
 from notebook.transutils import trans, _
 
-# Install the pyzmq ioloop. This has to be done before anything else from
-# tornado is imported.
-from zmq.eventloop import ioloop
-ioloop.install()
-
 # check for tornado 3.1.0
 try:
     import tornado
-except ImportError:
-    raise ImportError(_("The Jupyter Notebook requires tornado >= 4.0"))
+except ImportError as e:
+    raise ImportError(_("The Jupyter Notebook requires tornado >= 5.0")) from e
 try:
     version_info = tornado.version_info
-except AttributeError:
-    raise ImportError(_("The Jupyter Notebook requires tornado >= 4.0, but you have < 1.1.0"))
-if version_info < (4,0):
-    raise ImportError(_("The Jupyter Notebook requires tornado >= 4.0, but you have %s") % tornado.version)
+except AttributeError as e:
+    raise ImportError(_("The Jupyter Notebook requires tornado >= 5.0, but you have < 1.1.0")) from e
+if version_info < (5,0):
+    raise ImportError(_("The Jupyter Notebook requires tornado >= 5.0, but you have %s") % tornado.version)
 
 from tornado import httpserver
+from tornado import ioloop
 from tornado import web
 from tornado.httputil import url_concat
 from tornado.log import LogFormatter, app_log, access_log, gen_log
+if not sys.platform.startswith('win'):
+    from tornado.netutil import bind_unix_socket
 
 from notebook import (
+    DEFAULT_NOTEBOOK_PORT,
     DEFAULT_STATIC_FILES_PATH,
     DEFAULT_TEMPLATE_PATH_LIST,
     __version__,
@@ -107,7 +106,19 @@ from jupyter_core.paths import jupyter_runtime_dir, jupyter_path
 from notebook._sysinfo import get_sys_info
 
 from ._tz import utcnow, utcfromtimestamp
-from .utils import url_path_join, check_pid, url_escape, urljoin, pathname2url, run_sync
+from .utils import (
+    check_pid,
+    pathname2url,
+    run_sync,
+    unix_socket_in_use,
+    url_escape,
+    url_path_join,
+    urldecode_unix_socket_path,
+    urlencode_unix_socket,
+    urlencode_unix_socket_path,
+    urljoin,
+)
+from .traittypes import TypeFromClasses
 
 # Check if we can use async kernel management
 try:
@@ -115,6 +126,13 @@ try:
     async_kernel_mgmt_available = True
 except ImportError:
     async_kernel_mgmt_available = False
+
+# Tolerate missing terminado package.
+try:
+    from .terminal import TerminalManager
+    terminado_available = True
+except ImportError:
+    terminado_available = False
 
 #-----------------------------------------------------------------------------
 # Module globals
@@ -165,7 +183,10 @@ class NotebookWebApplication(web.Application):
             default_url, settings_overrides, jinja_env_options)
         handlers = self.init_handlers(settings)
 
-        super(NotebookWebApplication, self).__init__(handlers, **settings)
+        if settings['autoreload']:
+            log.info('Autoreload enabled: the webapp will restart when any Python src file changes.')
+
+        super().__init__(handlers, **settings)
 
     def init_settings(self, jupyter_app, kernel_manager, contents_manager,
                       session_manager, kernel_spec_manager,
@@ -218,16 +239,19 @@ class NotebookWebApplication(web.Application):
             warnings.warn(_("The `ignore_minified_js` flag is deprecated and will be removed in Notebook 6.0"), DeprecationWarning)
 
         now = utcnow()
-        
+
         root_dir = contents_manager.root_dir
-        home = py3compat.str_to_unicode(os.path.expanduser('~'), encoding=sys.getfilesystemencoding()) 
+        home = py3compat.str_to_unicode(os.path.expanduser('~'), encoding=sys.getfilesystemencoding())
         if root_dir.startswith(home + os.path.sep):
             # collapse $HOME to ~
             root_dir = '~' + root_dir[len(home):]
 
+        # Use the NotebookApp logger and its formatting for tornado request logging.
+        log_function = functools.partial(
+            log_request, log=log, log_json=jupyter_app.log_json)
         settings = dict(
             # basics
-            log_function=log_request,
+            log_function=log_function,
             base_url=base_url,
             default_url=default_url,
             template_path=template_path,
@@ -257,6 +281,7 @@ class NotebookWebApplication(web.Application):
             disable_check_xsrf=jupyter_app.disable_check_xsrf,
             allow_remote_access=jupyter_app.allow_remote_access,
             local_hostnames=jupyter_app.local_hostnames,
+            authenticate_prometheus=jupyter_app.authenticate_prometheus,
 
             # managers
             kernel_manager=kernel_manager,
@@ -284,7 +309,7 @@ class NotebookWebApplication(web.Application):
             allow_password_change=jupyter_app.allow_password_change,
             server_root_dir=root_dir,
             jinja2_env=env,
-            terminals_available=False,  # Set later if terminals are available
+            terminals_available=terminado_available and jupyter_app.terminals_enabled,
         )
 
         # allow custom overrides for the tornado web app.
@@ -392,7 +417,7 @@ class NotebookPasswordApp(JupyterApp):
     Setting a password secures the notebook server
     and removes the need for token-based authentication.
     """
-    
+
     description = __doc__
 
     def _config_file_default(self):
@@ -402,6 +427,7 @@ class NotebookPasswordApp(JupyterApp):
         from .auth.security import set_password
         set_password(config_file=self.config_file)
         self.log.info("Wrote hashed password to %s" % self.config_file)
+
 
 def shutdown_server(server_info, timeout=5, log=None):
     """Shutdown a notebook server in a separate process.
@@ -415,14 +441,39 @@ def shutdown_server(server_info, timeout=5, log=None):
     Returns True if the server was stopped by any means, False if stopping it
     failed (on Windows).
     """
-    from tornado.httpclient import HTTPClient, HTTPRequest
+    from tornado import gen
+    from tornado.httpclient import AsyncHTTPClient, HTTPClient, HTTPRequest
+    from tornado.netutil import Resolver
     url = server_info['url']
     pid = server_info['pid']
+    resolver = None
+
+    # UNIX Socket handling.
+    if url.startswith('http+unix://'):
+        # This library doesn't understand our URI form, but it's just HTTP.
+        url = url.replace('http+unix://', 'http://')
+
+        class UnixSocketResolver(Resolver):
+            def initialize(self, resolver):
+                self.resolver = resolver
+
+            def close(self):
+                self.resolver.close()
+
+            @gen.coroutine
+            def resolve(self, host, port, *args, **kwargs):
+                raise gen.Return([
+                    (socket.AF_UNIX, urldecode_unix_socket_path(host))
+                ])
+
+        resolver = UnixSocketResolver(resolver=Resolver())
+
     req = HTTPRequest(url + 'api/shutdown', method='POST', body=b'', headers={
         'Authorization': 'token ' + server_info['token']
     })
     if log: log.debug("POST request to %sapi/shutdown", url)
-    HTTPClient().fetch(req)
+    AsyncHTTPClient.configure(None, resolver=resolver)
+    HTTPClient(AsyncHTTPClient).fetch(req)
 
     # Poll to see if it shut down.
     for _ in range(timeout*10):
@@ -451,48 +502,87 @@ def shutdown_server(server_info, timeout=5, log=None):
 
 class NbserverStopApp(JupyterApp):
     version = __version__
-    description="Stop currently running notebook server for a given port"
+    description="Stop currently running notebook server."
 
-    port = Integer(8888, config=True,
-        help="Port of the server to be killed. Default 8888")
+    port = Integer(DEFAULT_NOTEBOOK_PORT, config=True,
+        help="Port of the server to be killed. Default %s" % DEFAULT_NOTEBOOK_PORT)
+
+    sock = Unicode(u'', config=True,
+        help="UNIX socket of the server to be killed.")
 
     def parse_command_line(self, argv=None):
-        super(NbserverStopApp, self).parse_command_line(argv)
+        super().parse_command_line(argv)
         if self.extra_args:
-            self.port=int(self.extra_args[0])
+            try:
+                self.port = int(self.extra_args[0])
+            except ValueError:
+                # self.extra_args[0] was not an int, so it must be a string (unix socket).
+                self.sock = self.extra_args[0]
 
     def shutdown_server(self, server):
         return shutdown_server(server, log=self.log)
 
+    def _shutdown_or_exit(self, target_endpoint, server):
+        print("Shutting down server on %s..." % target_endpoint)
+        server_stopped = self.shutdown_server(server)
+        if not server_stopped and sys.platform.startswith('win'):
+            # the pid check on Windows appears to be unreliable, so fetch another
+            # list of servers and ensure our server is not in the list before
+            # sending the wrong impression.
+            servers = list(list_running_servers(self.runtime_dir))
+            if server not in servers:
+                server_stopped = True
+        if not server_stopped:
+            sys.exit("Could not stop server on %s" % target_endpoint)
+
+    @staticmethod
+    def _maybe_remove_unix_socket(socket_path):
+        try:
+            os.unlink(socket_path)
+        except (OSError, IOError):
+            pass
+
     def start(self):
         servers = list(list_running_servers(self.runtime_dir))
         if not servers:
-            self.exit("There are no running servers")
+            self.exit("There are no running servers (per %s)" % self.runtime_dir)
+
         for server in servers:
-            if server['port'] == self.port:
-                print("Shutting down server on port", self.port, "...")
-                if not self.shutdown_server(server):
-                    sys.exit("Could not stop server")
-                return
+            if self.sock:
+                sock = server.get('sock', None)
+                if sock and sock == self.sock:
+                    self._shutdown_or_exit(sock, server)
+                    # Attempt to remove the UNIX socket after stopping.
+                    self._maybe_remove_unix_socket(sock)
+                    return
+            elif self.port:
+                port = server.get('port', None)
+                if port == self.port:
+                    self._shutdown_or_exit(port, server)
+                    return
         else:
-            print("There is currently no server running on port {}".format(self.port), file=sys.stderr)
-            print("Ports currently in use:", file=sys.stderr)
+            current_endpoint = self.sock or self.port
+            print(
+                "There is currently no server running on {}".format(current_endpoint),
+                file=sys.stderr
+            )
+            print("Ports/sockets currently in use:", file=sys.stderr)
             for server in servers:
-                print("  - {}".format(server['port']), file=sys.stderr)
+                print("  - {}".format(server.get('sock') or server['port']), file=sys.stderr)
             self.exit(1)
 
 
 class NbserverListApp(JupyterApp):
     version = __version__
     description=_("List currently running notebook servers.")
-    
+
     flags = dict(
         jsonlist=({'NbserverListApp': {'jsonlist': True}},
               _("Produce machine-readable JSON list output.")),
         json=({'NbserverListApp': {'json': True}},
               _("Produce machine-readable JSON object on each line of output.")),
     )
-    
+
     jsonlist = Bool(False, config=True,
           help=_("If True, the output will be a JSON list of objects, one per "
                  "active notebook server, each with the details from the "
@@ -533,11 +623,11 @@ flags['pylab']=(
 flags['no-mathjax']=(
     {'NotebookApp' : {'enable_mathjax' : False}},
     """Disable MathJax
-    
+
     MathJax is the javascript library Jupyter uses to render math/LaTeX. It is
     very large, so you may want to disable it if you have a slow internet
     connection, or for offline use of the notebook.
-    
+
     When disabled, equations etc. will appear as their untransformed TeX source.
     """
 )
@@ -545,6 +635,16 @@ flags['no-mathjax']=(
 flags['allow-root']=(
     {'NotebookApp' : {'allow_root' : True}},
     _("Allow the notebook to be run from root user.")
+)
+
+flags['autoreload'] = (
+    {'NotebookApp': {'autoreload': True}},
+    """Autoreload the webapp
+
+    Enable reloading of the tornado webapp and all imported Python packages
+    when any changes are made to any Python src files in Notebook or
+    extensions.
+    """
 )
 
 # Add notebook manager flags
@@ -558,6 +658,8 @@ aliases.update({
     'ip': 'NotebookApp.ip',
     'port': 'NotebookApp.port',
     'port-retries': 'NotebookApp.port_retries',
+    'sock': 'NotebookApp.sock',
+    'sock-mode': 'NotebookApp.sock_mode',
     'transport': 'KernelManager.transport',
     'keyfile': 'NotebookApp.keyfile',
     'certfile': 'NotebookApp.certfile',
@@ -577,20 +679,23 @@ class NotebookApp(JupyterApp):
     name = 'jupyter-notebook'
     version = __version__
     description = _("""The Jupyter HTML Notebook.
-    
+
     This launches a Tornado based HTML Notebook Server that serves up an HTML5/Javascript Notebook client.""")
     examples = _examples
     aliases = aliases
     flags = flags
-    
+
     classes = [
         KernelManager, Session, MappingKernelManager, KernelSpecManager,
         ContentsManager, FileContentsManager, NotebookNotary,
         GatewayKernelManager, GatewayKernelSpecManager, GatewaySessionManager, GatewayClient,
     ]
+    if terminado_available:  # Only necessary when terminado is available
+        classes.append(TerminalManager)
+
     flags = Dict(flags)
     aliases = Dict(aliases)
-    
+
     subcommands = dict(
         list=(NbserverListApp, NbserverListApp.description.splitlines()[0]),
         stop=(NbserverStopApp, NbserverStopApp.description.splitlines()[0]),
@@ -598,6 +703,43 @@ class NotebookApp(JupyterApp):
     )
 
     _log_formatter_cls = LogFormatter
+
+    _json_logging_import_error_logged = False
+
+    log_json = Bool(False, config=True,
+        help=_('Set to True to enable JSON formatted logs. '
+               'Run "pip install notebook[json-logging]" to install the '
+               'required dependent packages. Can also be set using the '
+               'environment variable JUPYTER_ENABLE_JSON_LOGGING=true.')
+    )
+
+    @default('log_json')
+    def _default_log_json(self):
+        """Get the log_json value from the environment."""
+        return os.getenv('JUPYTER_ENABLE_JSON_LOGGING', 'false').lower() == 'true'
+
+    @validate('log_json')
+    def _validate_log_json(self, proposal):
+        # If log_json=True, see if the json_logging package can be imported and
+        # override _log_formatter_cls if so.
+        value = proposal['value']
+        if value:
+            try:
+                import json_logging
+                self.log.debug('initializing json logging')
+                json_logging.init_non_web(enable_json=True)
+                self._log_formatter_cls = json_logging.JSONLogFormatter
+            except ImportError:
+                # If configured for json logs and we can't do it, log a hint.
+                # Only log the error once though.
+                if not self._json_logging_import_error_logged:
+                    self.log.warning(
+                        'Unable to use json logging due to missing packages. '
+                        'Run "pip install notebook[json-logging]" to fix.'
+                    )
+                    self._json_logging_import_error_logged = True
+                value = False
+        return value
 
     @default('log_level')
     def _default_log_level(self):
@@ -607,7 +749,7 @@ class NotebookApp(JupyterApp):
     def _default_log_datefmt(self):
         """Exclude date from default date format"""
         return "%H:%M:%S"
-    
+
     @default('log_format')
     def _default_log_format(self):
         """override default log format to include time"""
@@ -615,66 +757,70 @@ class NotebookApp(JupyterApp):
 
     ignore_minified_js = Bool(False,
             config=True,
-            help=_('Deprecated: Use minified JS file or not, mainly use during dev to avoid JS recompilation'), 
+            help=_('Deprecated: Use minified JS file or not, mainly use during dev to avoid JS recompilation'),
             )
 
     # file to be opened in the notebook server
     file_to_run = Unicode('', config=True)
 
     # Network related information
-    
+
     allow_origin = Unicode('', config=True,
         help="""Set the Access-Control-Allow-Origin header
-        
+
         Use '*' to allow any origin to access your server.
-        
+
         Takes precedence over allow_origin_pat.
         """
     )
-    
+
     allow_origin_pat = Unicode('', config=True,
         help="""Use a regular expression for the Access-Control-Allow-Origin header
-        
+
         Requests from an origin matching the expression will get replies with:
-        
+
             Access-Control-Allow-Origin: origin
-        
+
         where `origin` is the origin of the request.
-        
+
         Ignored if allow_origin is set.
         """
     )
-    
+
     allow_credentials = Bool(False, config=True,
         help=_("Set the Access-Control-Allow-Credentials: true header")
     )
-    
-    allow_root = Bool(False, config=True, 
+
+    allow_root = Bool(False, config=True,
         help=_("Whether to allow the user to run the notebook as root.")
     )
 
     use_redirect_file = Bool(True, config=True,
         help="""Disable launching browser by redirect file
 
-     For versions of notebook > 5.7.2, a security feature measure was added that 
-     prevented the authentication token used to launch the browser from being visible.
-     This feature makes it difficult for other users on a multi-user system from
-     running code in your Jupyter session as you.
+        For versions of notebook > 5.7.2, a security feature measure was added that
+        prevented the authentication token used to launch the browser from being visible.
+        This feature makes it difficult for other users on a multi-user system from
+        running code in your Jupyter session as you.
 
-     However, some environments (like Windows Subsystem for Linux (WSL) and Chromebooks),
-     launching a browser using a redirect file can lead the browser failing to load. 
-     This is because of the difference in file structures/paths between the runtime and 
-     the browser. 
-     
-     Disabling this setting to False will disable this behavior, allowing the browser 
-     to launch by using a URL and visible token (as before).
-     """
+        However, some environments (like Windows Subsystem for Linux (WSL) and Chromebooks),
+        launching a browser using a redirect file can lead the browser failing to load.
+        This is because of the difference in file structures/paths between the runtime and
+        the browser.
+
+        Disabling this setting to False will disable this behavior, allowing the browser
+        to launch by using a URL and visible token (as before).
+        """
+    )
+
+    autoreload = Bool(False, config=True,
+        help= ("Reload the webapp when changes are made to any Python src files.")
     )
 
     default_url = Unicode('/tree', config=True,
         help=_("The default URL to redirect to from `/`")
     )
-    
+
     ip = Unicode('localhost', config=True,
         help=_("The IP address the notebook server will listen on.")
     )
@@ -682,7 +828,7 @@ class NotebookApp(JupyterApp):
     @default('ip')
     def _default_ip(self):
         """Return localhost if available, 127.0.0.1 otherwise.
-        
+
         On some (horribly broken) systems, localhost cannot be bound.
         """
         s = socket.socket()
@@ -696,7 +842,7 @@ class NotebookApp(JupyterApp):
             return 'localhost'
 
     @validate('ip')
-    def _valdate_ip(self, proposal):
+    def _validate_ip(self, proposal):
         value = proposal['value']
         if value == u'*':
             value = u''
@@ -715,26 +861,71 @@ class NotebookApp(JupyterApp):
         or containerized setups for example).""")
     )
 
-    port = Integer(8888, config=True,
-        help=_("The port the notebook server will listen on.")
+    port_env = 'JUPYTER_PORT'
+    port_default_value = DEFAULT_NOTEBOOK_PORT
+    port = Integer(port_default_value, config=True,
+        help=_("The port the notebook server will listen on (env: JUPYTER_PORT).")
     )
 
-    port_retries = Integer(50, config=True,
-        help=_("The number of additional ports to try if the specified port is not available.")
+    @default('port')
+    def port_default(self):
+        return int(os.getenv(self.port_env, self.port_default_value))
+
+    port_retries_env = 'JUPYTER_PORT_RETRIES'
+    port_retries_default_value = 50
+    port_retries = Integer(port_retries_default_value, config=True,
+        help=_("The number of additional ports to try if the specified port is not "
+               "available (env: JUPYTER_PORT_RETRIES).")
     )
 
-    certfile = Unicode(u'', config=True, 
+    @default('port_retries')
+    def port_retries_default(self):
+        return int(os.getenv(self.port_retries_env, self.port_retries_default_value))
+
+
+    sock = Unicode(u'', config=True,
+        help=_("The UNIX socket the notebook server will listen on.")
+    )
+
+    sock_mode = Unicode('0600', config=True,
+        help=_("The permissions mode for UNIX socket creation (default: 0600).")
+    )
+
+    @validate('sock_mode')
+    def _validate_sock_mode(self, proposal):
+        value = proposal['value']
+        try:
+            converted_value = int(value.encode(), 8)
+            assert all((
+                # Ensure the mode is at least user readable/writable.
+                bool(converted_value & stat.S_IRUSR),
+                bool(converted_value & stat.S_IWUSR),
+                # And isn't out of bounds.
+                converted_value <= 2 ** 12
+            ))
+        except ValueError as e:
+            raise TraitError(
+                'invalid --sock-mode value: %s, please specify as e.g. "0600"' % value
+            ) from e
+        except AssertionError as e:
+            raise TraitError(
+                'invalid --sock-mode value: %s, must have u+rw (0600) at a minimum' % value
+            ) from e
+        return value
+
+
+    certfile = Unicode(u'', config=True,
         help=_("""The full path to an SSL/TLS certificate file.""")
     )
-    
-    keyfile = Unicode(u'', config=True, 
+
+    keyfile = Unicode(u'', config=True,
         help=_("""The full path to a private key file for usage with SSL/TLS.""")
     )
-    
+
     client_ca = Unicode(u'', config=True,
         help=_("""The full path to a certificate authority certificate for SSL/TLS client authentication.""")
     )
-    
+
     cookie_secret_file = Unicode(config=True,
         help=_("""The file where the cookie secret is stored.""")
     )
@@ -785,6 +976,9 @@ class NotebookApp(JupyterApp):
     token = Unicode('<generated>',
         help=_("""Token used for authenticating first-time connections to the server.
 
+        The token can be read from the file referenced by JUPYTER_TOKEN_FILE or set directly
+        with the JUPYTER_TOKEN environment variable.
+
         When no password is enabled,
         the default is to generate a new, random token.
 
@@ -799,6 +993,10 @@ class NotebookApp(JupyterApp):
         if os.getenv('JUPYTER_TOKEN'):
             self._token_generated = False
             return os.getenv('JUPYTER_TOKEN')
+        if os.getenv('JUPYTER_TOKEN_FILE'):
+            self._token_generated = False
+            with io.open(os.getenv('JUPYTER_TOKEN_FILE'), "r") as token_file:
+                return token_file.read()
         if self.password:
             # no token if password is enabled
             self._token_generated = False
@@ -809,8 +1007,8 @@ class NotebookApp(JupyterApp):
 
     max_body_size = Integer(512 * 1024 * 1024, config=True,
         help="""
-        Sets the maximum allowed size of the client request body, specified in 
-        the Content-Length request header field. If the size in a request 
+        Sets the maximum allowed size of the client request body, specified in
+        the Content-Length request header field. If the size in a request
         exceeds the configured value, a malformed HTTP message is returned to
         the client.
 
@@ -820,7 +1018,7 @@ class NotebookApp(JupyterApp):
 
     max_buffer_size = Integer(512 * 1024 * 1024, config=True,
         help="""
-        Gets or sets the maximum amount of memory, in bytes, that is allocated 
+        Gets or sets the maximum amount of memory, in bytes, that is allocated
         for use by the buffer manager.
         """
     )
@@ -875,12 +1073,12 @@ class NotebookApp(JupyterApp):
                       """
     )
 
-    allow_password_change = Bool(True, config=True, 
-                    help="""Allow password to be changed at login for the notebook server. 
+    allow_password_change = Bool(True, config=True,
+                    help="""Allow password to be changed at login for the notebook server.
 
                     While loggin in with a token, the notebook server UI will give the opportunity to
                     the user to enter a new password at the same time that will replace
-                    the token login mechanism. 
+                    the token login mechanism.
 
                     This can be set to false to prevent changing password from the UI/API.
                     """
@@ -993,11 +1191,11 @@ class NotebookApp(JupyterApp):
         help=_("DEPRECATED, use tornado_settings")
     )
 
-    @observe('webapp_settings') 
+    @observe('webapp_settings')
     def _update_webapp_settings(self, change):
         self.log.warning(_("\n    webapp_settings is deprecated, use tornado_settings.\n"))
         self.tornado_settings = change['new']
-    
+
     tornado_settings = Dict(config=True,
             help=_("Supply overrides for the tornado.web.Application that the "
                  "Jupyter notebook uses."))
@@ -1014,7 +1212,10 @@ class NotebookApp(JupyterApp):
         """)
     )
     terminado_settings = Dict(config=True,
-            help=_('Supply overrides for terminado. Currently only supports "shell_command".'))
+            help=_('Supply overrides for terminado. Currently only supports "shell_command". '
+                 'On Unix, if "shell_command" is not provided, a non-login shell is launched '
+                 "by default when the notebook server is connected to a terminal, a login "
+                 "shell otherwise."))
 
     cookie_options = Dict(config=True,
         help=_("Extra keyword arguments to pass to `set_secure_cookie`."
@@ -1027,15 +1228,15 @@ class NotebookApp(JupyterApp):
     ssl_options = Dict(config=True,
             help=_("""Supply SSL options for the tornado HTTPServer.
             See the tornado docs for details."""))
-    
-    jinja_environment_options = Dict(config=True, 
+
+    jinja_environment_options = Dict(config=True,
             help=_("Supply extra arguments that will be passed to Jinja environment."))
 
     jinja_template_vars = Dict(
         config=True,
         help=_("Extra variables to supply to jinja templates when rendering."),
     )
-    
+
     enable_mathjax = Bool(True, config=True,
         help="""Whether to enable MathJax for typesetting math/TeX
 
@@ -1068,7 +1269,7 @@ class NotebookApp(JupyterApp):
         if not value.endswith('/'):
             value = value + '/'
         return value
-    
+
     base_project_url = Unicode('/', config=True, help=_("""DEPRECATED use base_url"""))
 
     @observe('base_project_url')
@@ -1078,16 +1279,16 @@ class NotebookApp(JupyterApp):
 
     extra_static_paths = List(Unicode(), config=True,
         help="""Extra paths to search for serving static files.
-        
+
         This allows adding javascript/css to be available from the notebook server machine,
         or overriding individual files in the IPython"""
     )
-    
+
     @property
     def static_file_path(self):
         """return extra paths + the default location"""
         return self.extra_static_paths + [DEFAULT_STATIC_FILES_PATH]
-    
+
     static_custom_path = List(Unicode(),
         help=_("""Path to search for custom.js, css""")
     )
@@ -1118,7 +1319,7 @@ class NotebookApp(JupyterApp):
     extra_services = List(Unicode(), config=True,
         help=_("""handlers that should be loaded at higher priority than the default services""")
     )
-    
+
     @property
     def nbextensions_path(self):
         """The path to look for Javascript notebook extensions"""
@@ -1135,7 +1336,7 @@ class NotebookApp(JupyterApp):
     websocket_url = Unicode("", config=True,
         help="""The base URL for websockets,
         if it differs from the HTTP server (hint: it almost certainly doesn't).
-        
+
         Should be in the form of an HTTP origin: ws[s]://hostname[:port]
         """
     )
@@ -1153,7 +1354,7 @@ class NotebookApp(JupyterApp):
             return u''
         static_url_prefix = self.tornado_settings.get("static_url_prefix", "static")
         return url_path_join(static_url_prefix, 'components', 'MathJax', 'MathJax.js')
-    
+
     @observe('mathjax_url')
     def _update_mathjax_url(self, change):
         new = change['new']
@@ -1170,18 +1371,46 @@ class NotebookApp(JupyterApp):
     @observe('mathjax_config')
     def _update_mathjax_config(self, change):
         self.log.info(_("Using MathJax configuration file: %s"), change['new'])
-        
+
     quit_button = Bool(True, config=True,
         help="""If True, display a button in the dashboard to quit
         (shutdown the notebook server)."""
     )
 
-    contents_manager_class = Type(
+    # We relax this trait to handle Contents Managers using jupyter_server
+    # as the core backend.
+    contents_manager_class = TypeFromClasses(
         default_value=LargeFileManager,
-        klass=ContentsManager,
+        klasses=[
+            ContentsManager,
+            # To make custom ContentsManagers both forward+backward
+            # compatible, we'll relax the strictness of this trait
+            # and allow jupyter_server contents managers to pass
+            # through. If jupyter_server is not installed, this class
+            # will be ignored.
+            'jupyter_server.contents.services.managers.ContentsManager'
+        ],
         config=True,
         help=_('The notebook manager class to use.')
     )
+
+    # Throws a deprecation warning to jupyter_server based contents managers.
+    @observe('contents_manager_class')
+    def _observe_contents_manager_class(self, change):
+        new = change['new']
+        # If 'new' is a class, get a string representing the import
+        # module path.
+        if inspect.isclass(new):
+            new = new.__module__
+
+        if new.startswith('jupyter_server'):
+            self.log.warning(
+                "The specified 'contents_manager_class' class inherits a manager from the "
+                "'jupyter_server' package. These (future-looking) managers are not "
+                "guaranteed to work with the 'notebook' package. For longer term support "
+                "consider switching to NBClassic—a notebook frontend that leverages "
+                "Jupyter Server as its server backend."
+            )
 
     kernel_manager_class = Type(
         default_value=MappingKernelManager,
@@ -1231,7 +1460,7 @@ class NotebookApp(JupyterApp):
     )
 
     trust_xheaders = Bool(False, config=True,
-        help=(_("Whether to trust or not X-Scheme/X-Forwarded-Proto and X-Real-Ip/X-Forwarded-For headers"
+        help=(_("Whether to trust or not X-Scheme/X-Forwarded-Proto and X-Real-Ip/X-Forwarded-For headers "
               "sent by the upstream reverse proxy. Necessary if the proxy handles SSL"))
     )
 
@@ -1248,7 +1477,7 @@ class NotebookApp(JupyterApp):
     def _default_browser_open_file(self):
         basename = "nbserver-%s-open.html" % os.getpid()
         return os.path.join(self.runtime_dir, basename)
-    
+
     pylab = Unicode('disabled', config=True,
         help=_("""
         DISABLED: use %pylab or %matplotlib in the notebook to enable matplotlib.
@@ -1299,15 +1528,15 @@ class NotebookApp(JupyterApp):
     server_extensions = List(Unicode(), config=True,
         help=(_("DEPRECATED use the nbserver_extensions dict instead"))
     )
-    
+
     @observe('server_extensions')
     def _update_server_extensions(self, change):
         self.log.warning(_("server_extensions is deprecated, use nbserver_extensions"))
         self.server_extensions = change['new']
-        
+
     nbserver_extensions = Dict({}, config=True,
-        help=(_("Dict of Python modules to load as notebook server extensions."
-              "Entry values can be used to enable and disable the loading of"
+        help=(_("Dict of Python modules to load as notebook server extensions. "
+              "Entry values can be used to enable and disable the loading of "
               "the extensions. The extensions will be loaded in alphabetical "
               "order."))
     )
@@ -1326,7 +1555,7 @@ class NotebookApp(JupyterApp):
         Maximum rate at which stream output can be sent on iopub before they are
         limited."""))
 
-    rate_limit_window = Float(3, config=True, help=_("""(sec) Time window used to 
+    rate_limit_window = Float(3, config=True, help=_("""(sec) Time window used to
         check the message and data rate limits."""))
 
     shutdown_no_activity_timeout = Integer(0, config=True,
@@ -1349,8 +1578,39 @@ class NotebookApp(JupyterApp):
          is not available.
          """))
 
+    authenticate_prometheus = Bool(
+        True,
+        help=""""
+        Require authentication to access prometheus metrics.
+        """
+    ).tag(config=True)
+
+    @default('authenticate_prometheus')
+    def _default_authenticate_prometheus(self):
+        """ Authenticate Prometheus by default, unless auth is disabled. """
+        auth = bool(self.password) or bool(self.token)
+        if auth is False:
+            self.log.info(_("Authentication of /metrics is OFF, since other authentication is disabled."))
+        return auth
+
+    @observe('authenticate_prometheus')
+    def _update_authenticate_prometheus(self, change):
+        newauth = change['new']
+        if self.authenticate_prometheus is True and newauth is False:
+            self.log.info(_("Authentication of /metrics is being turned OFF."))
+        self.authenticate_prometheus = newauth
+
+    # Since use of terminals is also a function of whether the terminado package is
+    # available, this variable holds the "final indication" of whether terminal functionality
+    # should be considered (particularly during shutdown/cleanup).  It is enabled only
+    # once both the terminals "service" can be initialized and terminals_enabled is True.
+    # Note: this variable is slightly different from 'terminals_available' in the web settings
+    # in that this variable *could* remain false if terminado is available, yet the terminal
+    # service's initialization still fails.  As a result, this variable holds the truth.
+    terminals_available = False
+
     def parse_command_line(self, argv=None):
-        super(NotebookApp, self).parse_command_line(argv)
+        super().parse_command_line(argv)
 
         if self.extra_args:
             arg0 = self.extra_args[0]
@@ -1359,7 +1619,7 @@ class NotebookApp(JupyterApp):
             if not os.path.exists(f):
                 self.log.critical(_("No such file or directory: %s"), f)
                 self.exit(1)
-            
+
             # Use config here, to ensure that it takes higher priority than
             # anything that comes from the config dirs.
             c = Config()
@@ -1392,9 +1652,6 @@ class NotebookApp(JupyterApp):
         )
         #  Ensure the appropriate version of Python and jupyter_client is available.
         if isinstance(self.kernel_manager, AsyncMappingKernelManager):
-            if sys.version_info < (3, 6):  # Can be removed once 3.5 is dropped.
-                raise ValueError("You are using `AsyncMappingKernelManager` in Python 3.5 (or lower) "
-                                 "which is not supported. Please upgrade Python to 3.6+ or change kernel managers.")
             if not async_kernel_mgmt_available:  # Can be removed once jupyter_client >= 6.1 is required.
                 raise ValueError("You are using `AsyncMappingKernelManager` without an appropriate "
                                  "jupyter_client installed!  Please upgrade jupyter_client or change kernel managers.")
@@ -1421,7 +1678,7 @@ class NotebookApp(JupyterApp):
         # self.log is a child of. The logging module dispatches log messages to a log
         # and all of its ancenstors until propagate is set to False.
         self.log.propagate = False
-        
+
         for log in app_log, access_log, gen_log:
             # consistent log output name (NotebookApp instead of tornado.access, etc.)
             log.name = self.log.name
@@ -1430,7 +1687,7 @@ class NotebookApp(JupyterApp):
         logger.propagate = True
         logger.parent = self.log
         logger.setLevel(self.log.level)
-    
+
     def init_resources(self):
         """initialize system resources"""
         if resource is None:
@@ -1455,6 +1712,7 @@ class NotebookApp(JupyterApp):
         if self.allow_origin_pat:
             self.tornado_settings['allow_origin_pat'] = re.compile(self.allow_origin_pat)
         self.tornado_settings['allow_credentials'] = self.allow_credentials
+        self.tornado_settings['autoreload'] = self.autoreload
         self.tornado_settings['cookie_options'] = self.cookie_options
         self.tornado_settings['get_secure_cookie_kwargs'] = self.get_secure_cookie_kwargs
         self.tornado_settings['token'] = self.token
@@ -1468,6 +1726,35 @@ class NotebookApp(JupyterApp):
             self.log.critical(_("Hint: run the following command to set a password"))
             self.log.critical(_("\t$ python -m notebook.auth password"))
             sys.exit(1)
+
+        # Socket options validation.
+        if self.sock:
+            if self.port != DEFAULT_NOTEBOOK_PORT:
+                self.log.critical(
+                    _('Options --port and --sock are mutually exclusive. Aborting.'),
+                )
+                sys.exit(1)
+            else:
+                # Reset the default port if we're using a UNIX socket.
+                self.port = 0
+
+            if self.open_browser:
+                # If we're bound to a UNIX socket, we can't reliably connect from a browser.
+                self.log.info(
+                    _('Ignoring --NotebookApp.open_browser due to --sock being used.'),
+                )
+
+            if self.file_to_run:
+                self.log.critical(
+                    _('Options --NotebookApp.file_to_run and --sock are mutually exclusive.'),
+                )
+                sys.exit(1)
+
+            if sys.platform.startswith('win'):
+                self.log.critical(
+                    _('Option --sock is not supported on Windows, but got value of %s. Aborting.' % self.sock),
+                )
+                sys.exit(1)
 
         self.web_app = NotebookWebApplication(
             self, self.kernel_manager, self.contents_manager,
@@ -1498,25 +1785,56 @@ class NotebookApp(JupyterApp):
             )
             if ssl_options.get('ca_certs', False):
                 ssl_options.setdefault('cert_reqs', ssl.CERT_REQUIRED)
-        
+
         self.login_handler_class.validate_security(self, ssl_options=ssl_options)
         self.http_server = httpserver.HTTPServer(self.web_app, ssl_options=ssl_options,
                                                  xheaders=self.trust_xheaders,
                                                  max_body_size=self.max_body_size,
                                                  max_buffer_size=self.max_buffer_size)
 
+    def _bind_http_server(self):
+        return self._bind_http_server_unix() if self.sock else self._bind_http_server_tcp()
+
+    def _bind_http_server_unix(self):
+        if unix_socket_in_use(self.sock):
+            self.log.warning(_('The socket %s is already in use.') % self.sock)
+            return False
+
+        try:
+            sock = bind_unix_socket(self.sock, mode=int(self.sock_mode.encode(), 8))
+            self.http_server.add_socket(sock)
+        except socket.error as e:
+            if e.errno == errno.EADDRINUSE:
+                self.log.warning(_('The socket %s is already in use.') % self.sock)
+                return False
+            elif e.errno in (errno.EACCES, getattr(errno, 'WSAEACCES', errno.EACCES)):
+                self.log.warning(_("Permission to listen on sock %s denied") % self.sock)
+                return False
+            else:
+                raise
+        else:
+            return True
+
+    def _bind_http_server_tcp(self):
         success = None
         for port in random_ports(self.port, self.port_retries+1):
             try:
                 self.http_server.listen(port, self.ip)
             except socket.error as e:
+                eacces = (errno.EACCES, getattr(errno, 'WSAEACCES', errno.EACCES))
+                if sys.platform == 'cygwin':
+                    # Cygwin has a bug that causes EPERM to be returned in this
+                    # case instead of EACCES:
+                    # https://cygwin.com/ml/cygwin/2019-04/msg00160.html
+                    eacces += (errno.EPERM,)
+
                 if e.errno == errno.EADDRINUSE:
                     if self.port_retries:
                         self.log.info(_('The port %i is already in use, trying another port.') % port)
                     else:
                         self.log.info(_('The port %i is already in use.') % port)
                     continue
-                elif e.errno in (errno.EACCES, getattr(errno, 'WSAEACCES', errno.EACCES)):
+                elif e.errno in eacces:
                     self.log.warning(_("Permission to listen on port %i denied.") % port)
                     continue
                 else:
@@ -1533,35 +1851,46 @@ class NotebookApp(JupyterApp):
                 self.log.critical(_('ERROR: the notebook server could not be started because '
                               'port %i is not available.') % port)
             self.exit(1)
-    
+        return success
+
+    def _concat_token(self, url):
+        token = self.token if self._token_generated else '...'
+        return url_concat(url, {'token': token})
+
     @property
     def display_url(self):
         if self.custom_display_url:
             url = self.custom_display_url
             if not url.endswith('/'):
                 url += '/'
+        elif self.sock:
+            url = self._unix_sock_url()
         else:
             if self.ip in ('', '0.0.0.0'):
                 ip = "%s" % socket.gethostname()
             else:
                 ip = self.ip
-            url = self._url(ip)
-        if self.token:
-            # Don't log full token if it came from config
-            token = self.token if self._token_generated else '...'
-            url = (url_concat(url, {'token': token})
-                  + '\n or '
-                  + url_concat(self._url('127.0.0.1'), {'token': token}))
+            url = self._tcp_url(ip)
+        if self.token and not self.sock:
+            url = self._concat_token(url)
+            if not self.custom_display_url:
+                url += '\n or %s' % self._concat_token(self._tcp_url('127.0.0.1'))
         return url
 
     @property
     def connection_url(self):
-        ip = self.ip if self.ip else 'localhost'
-        return self._url(ip)
+        if self.sock:
+            return self._unix_sock_url()
+        else:
+            ip = self.ip if self.ip else 'localhost'
+            return self._tcp_url(ip)
 
-    def _url(self, ip):
+    def _unix_sock_url(self, token=None):
+        return '%s%s' % (urlencode_unix_socket(self.sock), self.base_url)
+
+    def _tcp_url(self, ip, port=None):
         proto = 'https' if self.certfile else 'http'
-        return "%s://%s:%i%s" % (proto, ip, self.port, self.base_url)
+        return "%s://%s:%i%s" % (proto, ip, port or self.port, self.base_url)
 
     def init_terminals(self):
         if not self.terminals_enabled:
@@ -1569,8 +1898,8 @@ class NotebookApp(JupyterApp):
 
         try:
             from .terminal import initialize
-            initialize(self.web_app, self.notebook_dir, self.connection_url, self.terminado_settings)
-            self.web_app.settings['terminals_available'] = True
+            initialize(nb_app=self)
+            self.terminals_available = True
         except ImportError as e:
             self.log.warning(_("Terminals not available (error was %s)"), e)
 
@@ -1584,7 +1913,7 @@ class NotebookApp(JupyterApp):
         if hasattr(signal, 'SIGINFO'):
             # only on BSD-based systems
             signal.signal(signal.SIGINFO, self._signal_info)
-    
+
     def _handle_sigint(self, sig, frame):
         """SIGINT handler spawns confirmation dialog"""
         # register more forceful signal handler for ^C^C case
@@ -1594,21 +1923,28 @@ class NotebookApp(JupyterApp):
         thread = threading.Thread(target=self._confirm_exit)
         thread.daemon = True
         thread.start()
-    
+
     def _restore_sigint_handler(self):
         """callback for restoring original SIGINT handler"""
         signal.signal(signal.SIGINT, self._handle_sigint)
-    
+
     def _confirm_exit(self):
         """confirm shutdown on ^C
-        
+
         A second ^C, or answering 'y' within 5s will cause shutdown,
         otherwise original SIGINT handler will be restored.
-        
+
         This doesn't work on Windows.
         """
         info = self.log.info
         info(_('interrupted'))
+        # Check if answer_yes is set
+        if self.answer_yes:
+            self.log.critical(_("Shutting down..."))
+            # schedule stop on the main thread,
+            # since this might be called from a signal handler
+            self.io_loop.add_callback_from_signal(self.io_loop.stop)
+            return
         print(self.notebook_info())
         yes = _('y')
         no = _('n')
@@ -1631,14 +1967,14 @@ class NotebookApp(JupyterApp):
         # use IOLoop.add_callback because signal.signal must be called
         # from main thread
         self.io_loop.add_callback_from_signal(self._restore_sigint_handler)
-    
+
     def _signal_stop(self, sig, frame):
         self.log.critical(_("received signal %s, stopping"), sig)
         self.io_loop.add_callback_from_signal(self.io_loop.stop)
 
     def _signal_info(self, sig, frame):
         print(self.notebook_info())
-    
+
     def init_components(self):
         """Check the components submodule, and warn if it's unclean"""
         # TODO: this should still check, but now we use bower, not git submodule
@@ -1648,7 +1984,7 @@ class NotebookApp(JupyterApp):
         """Consolidate server extensions specified by all configs.
 
         The resulting list is stored on self.nbserver_extensions and updates config object.
-        
+
         The extension API is experimental, and may change in future releases.
         """
         # TODO: Remove me in notebook 5.0
@@ -1669,7 +2005,7 @@ class NotebookApp(JupyterApp):
         manager = ConfigManager(read_config_path=config_path)
         section = manager.get(self.config_file_name)
         extensions = section.get('NotebookApp', {}).get('nbserver_extensions', {})
-        
+
         for modulename, enabled in sorted(extensions.items()):
             if modulename not in self.nbserver_extensions:
                 self.config.NotebookApp.nbserver_extensions.update({modulename: enabled})
@@ -1680,10 +2016,10 @@ class NotebookApp(JupyterApp):
 
         Import the module, then call the load_jupyter_server_extension function,
         if one exists.
-        
+
         The extension API is experimental, and may change in future releases.
         """
-        
+
 
         for modulename, enabled in sorted(self.nbserver_extensions.items()):
             if enabled:
@@ -1711,7 +2047,8 @@ class NotebookApp(JupyterApp):
         # ensure css, js are correct, which are required for pages to function
         mimetypes.add_type('text/css', '.css')
         mimetypes.add_type('application/javascript', '.js')
-
+        # for python <3.8
+        mimetypes.add_type('application/wasm', '.wasm')
 
     def shutdown_no_activity(self):
         """Shutdown server on timeout when there are no kernels or terminals."""
@@ -1719,11 +2056,8 @@ class NotebookApp(JupyterApp):
         if len(km) != 0:
             return   # Kernels still running
 
-        try:
+        if self.terminals_available:
             term_mgr = self.web_app.settings['terminal_manager']
-        except KeyError:
-            pass  # Terminals not enabled
-        else:
             if term_mgr.terminals:
                 return   # Terminals still running
 
@@ -1779,7 +2113,7 @@ class NotebookApp(JupyterApp):
     def initialize(self, argv=None):
         self._init_asyncio_patch()
 
-        super(NotebookApp, self).initialize(argv)
+        super().initialize(argv)
         self.init_logging()
         if self._dispatching:
             return
@@ -1796,7 +2130,7 @@ class NotebookApp(JupyterApp):
 
     def cleanup_kernels(self):
         """Shutdown all kernels.
-        
+
         The kernels will shutdown themselves when this process no longer exists,
         but explicit shutdown allows the KernelManagers to cleanup the connection files.
         """
@@ -1804,6 +2138,21 @@ class NotebookApp(JupyterApp):
         kernel_msg = trans.ngettext('Shutting down %d kernel', 'Shutting down %d kernels', n_kernels)
         self.log.info(kernel_msg % n_kernels)
         run_sync(self.kernel_manager.shutdown_all())
+
+    def cleanup_terminals(self):
+        """Shutdown all terminals.
+
+        The terminals will shutdown themselves when this process no longer exists,
+        but explicit shutdown allows the TerminalManager to cleanup.
+        """
+        if not self.terminals_available:
+            return
+
+        terminal_manager = self.web_app.settings['terminal_manager']
+        n_terminals = len(terminal_manager.list())
+        terminal_msg = trans.ngettext('Shutting down %d terminal', 'Shutting down %d terminals', n_terminals)
+        self.log.info(terminal_msg % n_terminals)
+        run_sync(terminal_manager.terminate_all())
 
     def notebook_info(self, kernel_count=True):
         "Return the current working directory and the server url information"
@@ -1825,6 +2174,7 @@ class NotebookApp(JupyterApp):
         return {'url': self.connection_url,
                 'hostname': self.ip if self.ip else 'localhost',
                 'port': self.port,
+                'sock': self.sock,
                 'secure': bool(self.certfile),
                 'base_url': self.base_url,
                 'token': self.token,
@@ -1925,11 +2275,11 @@ class NotebookApp(JupyterApp):
 
     def start(self):
         """ Start the Notebook server app, after initialization
-        
+
         This method takes no arguments so all configuration and initialization
         must be done prior to calling this method."""
 
-        super(NotebookApp, self).start()
+        super().start()
 
         if not self.allow_root:
             # check if we are running as root, and abort if it's not allowed
@@ -1940,6 +2290,12 @@ class NotebookApp(JupyterApp):
             if uid == 0:
                 self.log.critical(_("Running as root is not recommended. Use --allow-root to bypass."))
                 self.exit(1)
+
+        success = self._bind_http_server()
+        if not success:
+            self.log.critical(_('ERROR: the notebook server could not be started because '
+                              'no available port could be found.'))
+            self.exit(1)
 
         info = self.log.info
         for line in self.notebook_info(kernel_count=False).split("\n"):
@@ -1954,19 +2310,40 @@ class NotebookApp(JupyterApp):
         self.write_server_info_file()
         self.write_browser_open_file()
 
-        if self.open_browser or self.file_to_run:
+        if (self.open_browser or self.file_to_run) and not self.sock:
             self.launch_browser()
 
         if self.token and self._token_generated:
             # log full URL with generated token, so there's a copy/pasteable link
             # with auth info.
-            self.log.critical('\n'.join([
-                '\n',
-                'To access the notebook, open this file in a browser:',
-                '    %s' % urljoin('file:', pathname2url(self.browser_open_file)),
-                'Or copy and paste one of these URLs:',
-                '    %s' % self.display_url,
-            ]))
+            if self.sock:
+                self.log.critical('\n'.join([
+                    '\n',
+                    'Notebook is listening on %s' % self.display_url,
+                    '',
+                    (
+                        'UNIX sockets are not browser-connectable, but you can tunnel to '
+                        'the instance via e.g.`ssh -L 8888:%s -N user@this_host` and then '
+                        'open e.g. %s in a browser.'
+                    ) % (self.sock, self._concat_token(self._tcp_url('localhost', 8888)))
+                ]))
+            else:
+                if not self.custom_display_url:
+                    self.log.critical('\n'.join([
+                        '\n',
+                        'To access the notebook, open this file in a browser:',
+                        '    %s' % urljoin('file:', pathname2url(self.browser_open_file)),
+                        'Or copy and paste one of these URLs:',
+                        '    %s' % self.display_url,
+                    ]))
+                else:
+                    self.log.critical('\n'.join([
+                        '\n',
+                        'To access the notebook, open this file in a browser:',
+                        '    %s' % urljoin('file:', pathname2url(self.browser_open_file)),
+                        'Or copy and paste this URL:',
+                        '    %s' % self.display_url,
+                    ]))
 
         self.io_loop = ioloop.IOLoop.current()
         if sys.platform.startswith('win'):
@@ -1982,6 +2359,7 @@ class NotebookApp(JupyterApp):
             self.remove_server_info_file()
             self.remove_browser_open_file()
             self.cleanup_kernels()
+            self.cleanup_terminals()
 
     def stop(self):
         def _stop():
@@ -1992,7 +2370,7 @@ class NotebookApp(JupyterApp):
 
 def list_running_servers(runtime_dir=None):
     """Iterate over the server info files of running notebook servers.
-    
+
     Given a runtime directory, find nbserver-* files in the security directory,
     and yield dicts of their information, each one pertaining to
     a currently running notebook server instance.

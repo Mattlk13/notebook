@@ -42,3 +42,17 @@ config.rst
 package-lock.json
 geckodriver.log
 *.iml
+
+# jetbrains IDE stuff
+*.iml
+.idea/
+
+# ms IDE stuff
+*.code-workspace
+.history
+.vscode
+
+# copied changelog
+docs/source/changelog.md
+
+.jupyter_releaser_checkout
